@@ -1,0 +1,963 @@
+"""Observation-only dispatch with explicit walking, empty travel, and recovery."""
+
+import copy
+import time
+from dataclasses import replace
+
+from adaptive_hrc_scheduling import production_cancel as cancellation
+from adaptive_hrc_scheduling import production_supports as supports
+from adaptive_hrc_scheduling.building_human import calendar_state
+from adaptive_hrc_scheduling.contracts.codec import ContractError
+from adaptive_hrc_scheduling.contracts.production import mode_for, validate
+from adaptive_hrc_scheduling.domain import production as m
+from adaptive_hrc_scheduling.dynamic_workforce import control_location, eligible, off_shift
+from adaptive_hrc_scheduling.production_admission import applicable, completed_activity
+from adaptive_hrc_scheduling.production_backend import ProductionBackend
+from adaptive_hrc_scheduling.production_geometry import route, standing_point, transport_sweeps
+from adaptive_hrc_scheduling.production_navigation import (
+    clear_segment,
+    ingress_groups,
+    walk,
+    walk_blocker,
+    walk_obstacles,
+)
+from adaptive_hrc_scheduling.production_rework import active
+
+
+def planning_input(config, observation, budget_ms=100):
+    validate(observation, config=config)
+    released = {p.product_id for p in observation.state.products if p.released}
+    cancelled = {p.product_id for p in observation.state.products if p.cancelled}
+    value = m.PlanningInput(
+        config.schema_version,
+        config.id,
+        observation,
+        tuple(
+            o
+            for o in config.operations
+            if o.product_id in released
+            and active(config, observation.state.gates, o)
+            and applicable(o, observation.state.mode_attempts)
+            and (
+                o.product_id not in cancelled
+                or cancellation.disposal(config, o)
+                or o.action in ("RETURN", "SCRAP", "RELEASE_RESERVATION")
+                or any(r.command.operation_id == o.id for r in observation.state.running)
+            )
+        ),
+        budget_ms,
+    )
+    validate(value, config=config)
+    return value
+
+
+def _static_bindings(config, state, operation, crews, busy):
+    """Keep nominal/research assignments and match unavailable roles distinctly."""
+    requested = {
+        r.id: crews.get(operation.activity_id + ":" + r.id) if config.research else None
+        for r in operation.roles
+    }
+    nominal = {r.id: requested[r.id] or r.id for r in operation.roles}
+    assigned = dict(nominal)
+    if config.schema_version == "P043-PROD-1.0":
+        missing = [
+            r for r in operation.roles if not requested[r.id] and not eligible(state, nominal[r.id])
+        ]
+        missing_ids = {r.id for r in missing}
+        used = {p for role_id, p in nominal.items() if role_id not in missing_ids}
+        fatigue = {h.person_id: h.fatigue for h in state.humans}
+        options = {
+            r.id: sorted(
+                (
+                    p.id
+                    for p in config.people
+                    if r.qualification in p.qualifications
+                    and eligible(state, p.id)
+                    and p.id not in used
+                ),
+                key=lambda pid: (pid in busy, fatigue[pid], pid),
+            )
+            for r in missing
+        }
+
+        def match(index):
+            if index == len(missing):
+                return True
+            role = missing[index]
+            for person in options[role.id]:
+                if person in used:
+                    continue
+                assigned[role.id] = person
+                used.add(person)
+                if match(index + 1):
+                    return True
+                used.remove(person)
+            return False
+
+        if not match(0):
+            # No distinct crew exists. Preserve nominal unavailable people so
+            # the original personnel admission guard explains the wait.
+            assigned = nominal
+    return tuple(m.RoleBinding(r.id, assigned[r.id]) for r in operation.roles)
+
+
+def choose(
+    config,
+    value,
+    *,
+    rule="EDD",
+    sequence=0,
+    excluded_operations=(),
+    mode_choices=(),
+    crew_choices=(),
+    order_bias=(),
+    start_slots=(),
+    rest_people=(),
+    _world_factory=None,
+):
+    validate(value, config=config)
+    if rule not in ("EDD", "SPT", "FASTEST_LEGAL"):
+        raise ValueError("Unknown rule")
+
+    def plan(*args):
+        return m.Plan(*args, research=config.research)
+
+    modes, crews, order, slots = map(dict, (mode_choices, crew_choices, order_bias, start_slots))
+    start, obs = time.perf_counter(), value.observation
+    factory = ProductionBackend if _world_factory is None else _world_factory
+    world = factory(config, run_id=obs.run_id, epoch=obs.epoch)
+    world.s = obs.state
+    for running in obs.state.running:
+        if running.command.service:
+            service = running.command.service
+            world.operations[service.operation.id] = service.operation
+            if service.route:
+                world.routes[service.route.id] = service.route
+    positions = {p.id: p.location for p in obs.state.positions}
+    busy = {o.resource_id for o in obs.state.owners}
+    deadlines = {p.id: p.due_h for p in config.products}
+    reasons = []
+    walk_cache = {}
+    done = set(obs.state.completed)
+    occupied_ingress = ingress_groups(config, obs.state)
+    cancel_services = {
+        s.operation.id: s
+        for s in cancellation.candidates(config, obs.state)
+        if s.operation.id not in excluded_operations
+    }
+    for item in cancel_services.values():
+        world.operations[item.operation.id] = item.operation
+        if item.route:
+            world.routes[item.route.id] = item.route
+
+    handover_services = {}
+    endpoint_blocked = {}
+
+    def fixed_endpoint_blocked(person, op, role):
+        if config.schema_version != "P043-PROD-1.0" or len(config.people) <= 15:
+            return False
+        destination = next((p.location for p in op.role_locations if p.person_id == role.id), None)
+        if destination is None:
+            return False
+        key = (person.id, destination)
+        if key not in endpoint_blocked:
+            point = standing_point(config, person.id, destination)
+            obstacles = walk_obstacles(
+                config, obs.state, person.id, positions[person.id], destination
+            )
+            # People may clear through ordinary admitted walking services.
+            # A machine or load cannot be ignored to make a crew reachable.
+            fixed = [box for box in obstacles if box[0] not in world.people]
+            endpoint_blocked[key] = not clear_segment(point, point, fixed)
+        return endpoint_blocked[key]
+
+    def bindings_for(op):
+        if not op.branch:
+            committed = next(
+                (a.roles for a in obs.state.activity_crews if a.activity_id == op.activity_id), None
+            )
+            if committed is not None:
+                return committed
+            return _static_bindings(config, obs.state, op, crews, busy)
+        attempt = next(
+            (a for a in obs.state.mode_attempts if a.activity_id == op.activity_id), None
+        )
+        if attempt and op.roles:
+            return attempt.crew
+        return tuple(
+            m.RoleBinding(
+                r.id,
+                min(
+                    (
+                        p
+                        for p in config.people
+                        if r.qualification in p.qualifications
+                        and (op.activity_id not in crews or p.id == crews[op.activity_id])
+                    ),
+                    key=lambda p: (
+                        not eligible(obs.state, p.id)
+                        if config.schema_version == "P043-PROD-1.0"
+                        else False,
+                        fixed_endpoint_blocked(p, op, r),
+                        p.id in busy,
+                        next(h.fatigue for h in obs.state.humans if h.person_id == p.id),
+                        p.id,
+                    ),
+                ).id,
+            )
+            for r in op.roles
+        )
+
+    def command(op, service=None, held=None):
+        service = (
+            service
+            or (held.command.service if held else None)
+            or cancel_services.get(op.id)
+            or handover_services.get(op.id)
+        )
+        return m.DispatchCommand(
+            config.schema_version,
+            config.id,
+            obs.config_sha256,
+            obs.run_id,
+            obs.epoch,
+            f"PLAN-{obs.state.revision}-{sequence}-{op.id}",
+            op.product_id,
+            op.activity_id,
+            op.id,
+            op.attempt_index,
+            op.unit_index,
+            mode_for(op),
+            obs.sampled_h,
+            obs.state.revision,
+            held.command.roles if held else bindings_for(op),
+            resume_of=held.command.id if held else None,
+            service=service,
+            branch=op.branch,
+            research=config.research,
+        )
+
+    def admissible(cmd):
+        candidate = copy.copy(world)
+        if cmd.service:
+            candidate.operations, candidate.routes = dict(world.operations), dict(world.routes)
+            candidate.operations[cmd.operation_id] = cmd.service.operation
+            if cmd.service.route:
+                candidate.routes[cmd.service.route.id] = cmd.service.route
+        try:
+            candidate._admit(cmd)
+            return None
+        except ContractError as exc:
+            return str(exc)
+
+    def clear_person(parent, blocker, clearing=()):
+        if config.schema_version != "P043-PROD-1.0":
+            return None
+        newcomers = {p.id for p in config.people[15:]}
+        if blocker not in newcomers and not newcomers.intersection(clearing):
+            # Keep the original traffic ordering for the initial workforce.
+            # This extension only resolves access involving added people.
+            return None
+        protected = {b.person_id for b in bindings_for(parent)}
+        if (
+            blocker not in world.people
+            or blocker in clearing
+            or blocker in protected
+            or blocker in busy
+            or not eligible(obs.state, blocker)
+            or any(
+                a.state != "COMPLETE" and any(b.person_id == blocker for b in a.crew)
+                for a in obs.state.mode_attempts
+            )
+            or any(
+                any(b.person_id == blocker for b in a.roles)
+                and any(
+                    o.activity_id == a.activity_id
+                    and o.roles
+                    and not o.branch
+                    and not o.handover
+                    and o.id not in done
+                    for o in config.operations
+                )
+                for a in obs.state.activity_crews
+            )
+        ):
+            return None
+        parks = [control_location(config, blocker)]
+        parks.extend(
+            control_location(config, p.id) for p in config.people if off_shift(obs.state, p.id)
+        )
+        if blocker == "Lsig":
+            parks.append("CONTROL-PARK-Lsig")
+        # Keep the existing signal-person refuge free. Vacated control places
+        # are only candidates: routes, occupancy and return gates still apply.
+        for park in dict.fromkeys(parks):
+            if park not in world.places or positions[blocker] == park:
+                continue
+            cleared = service_for(parent, blocker, park, clearing=(*clearing, blocker))
+            if cleared:
+                return cleared
+        return None
+
+    def service_for(parent, entity, destination=None, rest=False, clearing=()):
+        source = positions[entity]
+        if source not in world.places or entity in busy or "ENTITY:" + entity in busy:
+            return None
+        person = entity in world.people
+        action = "REST" if rest else "WALK" if person else "EMPTY_RETURN"
+        ident = f"SERVICE-{obs.state.revision}-{entity}-{action}"
+        if person:
+            roles = (m.Role(entity, world.people[entity].qualifications[0]),)
+            locations, equipment = (m.PersonPosition(entity, source),), ()
+        else:
+            ids = (
+                ("Lop", "Lrig", "Lsig")
+                if entity == "CR1"
+                else ("P1" if entity == "FORK-01" else "E1" if entity == "CART-01" else "QA1",)
+            )
+            quals = (
+                ("CRANE", "RIG", "SIGNAL")
+                if entity == "CR1"
+                else ("FORK" if entity == "FORK-01" else "CART" if entity == "CART-01" else "TOOL",)
+            )
+            roles = tuple(m.Role(i, q) for i, q in zip(ids, quals))
+            locations = tuple(
+                m.PersonPosition(i, "CONTROL-" + i if entity == "CR1" else source) for i in ids
+            )
+            equipment = (entity,)
+            for loc in locations:
+                if positions[loc.person_id] != loc.location:
+                    return service_for(parent, loc.person_id, loc.location)
+        rt = (
+            None
+            if rest
+            else route(
+                config,
+                "ROUTE-" + ident,
+                source,
+                destination,
+                None if person else entity,
+                person=entity if person else None,
+                empty=not person,
+            )
+        )
+        if person and not rest:
+            try:
+                walk_key = (entity, source, destination)
+                if walk_key not in walk_cache:
+                    try:
+                        walk_cache[walk_key] = walk(config, obs.state, entity, source, destination)
+                    except ContractError as exc:
+                        walk_cache[walk_key] = str(exc)
+                if isinstance(walk_cache[walk_key], str):
+                    raise ContractError(walk_cache[walk_key])
+                rt = replace(
+                    rt,
+                    points=tuple(m.Point(*p) for p in walk_cache[walk_key]),
+                )
+            except ContractError as exc:
+                reasons.append(ident + ":" + str(exc))
+                if (
+                    config.schema_version == "P043-PROD-1.0"
+                    and str(exc) == "NO_LEGAL_PERSON_ACCESS"
+                ):
+                    for location in (source, destination):
+                        point = standing_point(config, entity, location)
+                        blocker = walk_blocker(
+                            config, obs.state, entity, source, destination, (point, point)
+                        )
+                        cleared = clear_person(parent, blocker, (*clearing, entity))
+                        if cleared:
+                            return cleared
+                    home = control_location(config, entity)
+                    if (
+                        entity in {p.id for p in config.people[15:]}
+                        and source
+                        in {
+                            control_location(config, p.id)
+                            for p in config.people
+                            if off_shift(obs.state, p.id)
+                        }
+                        and source != home
+                        and destination != home
+                    ):
+                        # A newcomer can itself occupy the only vacated place
+                        # needed by its blocker. First leave through a normal
+                        # admitted walk; never swap or teleport the people.
+                        repositioned = service_for(
+                            parent, entity, home, clearing=(*clearing, entity)
+                        )
+                        if repositioned:
+                            return repositioned
+                return None
+        op = m.Operation(
+            ident,
+            parent.product_id,
+            ident,
+            action,
+            "REST"
+            if rest
+            else "WALK"
+            if person
+            else "WORK"
+            if entity == "CR1"
+            else "DRIVE"
+            if entity == "FORK-01"
+            else "PUSH",
+            (),
+            roles,
+            locations,
+            equipment,
+            source,
+            None if rest else destination,
+            rt.id if rt else None,
+            entity,
+            (),
+            (),
+            0,
+            config.min_rest_h if rest else 0,
+            0,
+            ("ML-METHOD",),
+            (),
+            None,
+            None,
+            None,
+        )
+        cmd = command(op, m.Service(op, rt))
+        reason = admissible(cmd)
+        if reason:
+            reasons.append(ident + ":" + reason)
+        if reason and reason.startswith("TRANSPORT_COLLISION:"):
+            cleared = clear_person(parent, reason.split(":", 1)[1], (*clearing, entity))
+            if cleared:
+                return cleared
+        if reason == "HUMAN_CAP" and not rest:
+            for role in roles:
+                rested = service_for(parent, role.id, rest=True)
+                if rested:
+                    return rested
+        return cmd if reason is None else None
+
+    unfinished = next((o for o in value.operations if o.id not in done), None)
+    if unfinished is None and any(not p.released for p in obs.state.products):
+        # A known but unreleased order can keep the event clock running after
+        # all released work finishes. Rest still belongs to a released product;
+        # this does not expose its future arrival time or prepare its material.
+        unfinished = next(iter(value.operations), None)
+    if unfinished is not None:
+        for requested in rest_people:
+            rested = service_for(unfinished, requested, rest=True)
+            if rested:
+                return plan(
+                    config.schema_version,
+                    config.id,
+                    obs.id,
+                    (rested,),
+                    "CANDIDATE",
+                    "PROPOSED_REST",
+                )
+        for human in obs.state.humans:
+            person = world.people[human.person_id]
+            phase, shift_end = calendar_state(person, obs.sampled_h)
+            if (
+                phase == "WAIT"
+                and human.person_id not in busy
+                and human.fatigue + person.wait_rate * (shift_end - obs.sampled_h)
+                > config.cap + 1e-10
+            ):
+                # WAIT is exposure, not recovery. Reserve an explicit existing
+                # minimum rest before an idle person can cross the cap while
+                # another command runs or the driver advances its event clock.
+                rest = service_for(unfinished, human.person_id, rest=True)
+                if rest:
+                    return plan(
+                        config.schema_version,
+                        config.id,
+                        obs.id,
+                        (rest,),
+                        "CANDIDATE",
+                        "IDLE_CAP_REST",
+                    )
+
+    for rack in obs.state.supports:
+        if not rack.clearance_people:
+            continue
+        layout = world._support_layout(rack.layout_id)
+        parent = next(
+            (
+                o
+                for o in value.operations
+                if o.entity_id in world.lots
+                and world.lots[o.entity_id].group_id == layout.group_id
+                and o.id not in done
+            ),
+            None,
+        )
+        if parent is None:
+            continue
+        for person in rack.clearance_people:
+            cleared = service_for(parent, person, control_location(config, person))
+            if cleared:
+                return plan(
+                    config.schema_version,
+                    config.id,
+                    obs.id,
+                    (cleared,),
+                    "CANDIDATE",
+                    "PREPARE:" + parent.id,
+                )
+
+    for carrier, park in (("FORK-01", "FORK-PARK"), ("CART-01", "CART-PARK")):
+        location = positions[carrier]
+        if location not in world.places or world.places[location].parent not in ("F1", "J3"):
+            continue
+        pending_pickup = any(
+            o.route_id
+            and world.routes[o.route_id].device_id == carrier
+            and o.location == location
+            and positions.get(o.entity_id) == location
+            and o.id not in obs.state.completed
+            and all(p in obs.state.completed for p in o.prerequisites)
+            for o in value.operations
+        )
+        if pending_pickup:
+            continue
+        previous = next(
+            (
+                o
+                for o in config.operations
+                if o.route_id
+                and o.target == location
+                and world.routes[o.route_id].device_id == carrier
+                and o.id in obs.state.completed
+            ),
+            None,
+        )
+        if previous and previous.id in {o.id for o in value.operations}:
+            cleanup = service_for(previous, carrier, park)
+            if cleanup:
+                return plan(
+                    config.schema_version,
+                    config.id,
+                    obs.id,
+                    (cleanup,),
+                    "CANDIDATE",
+                    "PREPARE:" + previous.id,
+                )
+
+    def priority(o):
+        stage = int(o.id.rsplit(".DELIVER-", 1)[1]) if ".DELIVER-" in o.id else -1
+        point = world.places[o.location].position
+        return (
+            order.get(o.activity_id, 0),
+            deadlines[o.product_id] if rule == "EDD" else o.base_h,
+            -stage,
+            point[1] if stage >= 0 else 0,
+            -point[2] if stage >= 0 else 0,
+            -point[0] if stage >= 0 else 0,
+            o.id,
+        )
+
+    handover_services = {}
+    if config.research:
+        from adaptive_hrc_scheduling.production_handover import operation as handover_operation
+
+        for a in obs.state.mode_attempts:
+            if (
+                a.state != "COMMITTED"
+                or not a.completed_units
+                or any(r.command.activity_id == a.activity_id for r in obs.state.running)
+            ):
+                continue
+            desired = crews.get(a.activity_id)
+            if (
+                config.schema_version == "P043-PROD-1.0"
+                and a.crew
+                and not eligible(obs.state, a.crew[0].person_id)
+            ):
+                replacements = [
+                    p
+                    for p in config.people
+                    if "WELD" in p.qualifications and eligible(obs.state, p.id)
+                ]
+                if replacements:
+                    desired = min(
+                        replacements,
+                        key=lambda p: (
+                            positions[p.id] != "J2",
+                            next(h.fatigue for h in obs.state.humans if h.person_id == p.id),
+                            p.id,
+                        ),
+                    ).id
+            if a.handover is not None:
+                change = replace(a.handover, phase="RESTORE")
+            elif desired is not None and desired != a.crew[0].person_id:
+                change = m.Handover(
+                    a.activity_id,
+                    a.definition_id,
+                    a.crew[0].person_id,
+                    desired,
+                    a.completed_units[-1],
+                    "HANDOVER",
+                )
+            else:
+                continue
+            try:
+                op = handover_operation(
+                    config, change, f"HANDOVER-{obs.state.revision}-{a.activity_id}-{change.phase}"
+                )
+            except ContractError:
+                continue
+            handover_services[op.id] = m.Service(op, None)
+            world.operations[op.id] = op
+
+    cancelled = {p.product_id for p in obs.state.products if p.cancelled}
+    candidates = sorted(
+        [
+            o
+            for o in value.operations
+            if o.product_id not in cancelled
+            or cancellation.disposal(config, o)
+            or o.action in ("RETURN", "SCRAP", "RELEASE_RESERVATION")
+            or any(r.command.operation_id == o.id for r in obs.state.running)
+        ]
+        + [s.operation for s in cancel_services.values()]
+        + [s.operation for s in handover_services.values()]
+        + (
+            [
+                r.command.service.operation
+                for r in obs.state.running
+                if r.status == "EXCEPTION" and r.command.service
+            ]
+            if config.schema_version == "P043-PROD-1.0"
+            else []
+        ),
+        # P043 interrupted services retain their original operation/route and
+        # resume identity; they are not part of the frozen static operation list.
+        key=priority,
+    )
+
+    if config.schema_version in ("P042-PROD-1.0", "P043-PROD-1.0", "P053-PROD-1.0"):
+        # New raw stock cannot enter an occupied receiving lane. When the
+        # previous delivery leaves an empty carrier there, physically clear it
+        # using the ordinary, fully admitted walking/empty-return service.
+        fork_location = positions["FORK-01"]
+        root = world.places.get(fork_location)
+        waiting = next(
+            (
+                o
+                for o in candidates
+                if o.action == "TRANSFER"
+                and o.entity_id in world.lots
+                and world.lots[o.entity_id].material == "STEEL"
+                and not world.lots[o.entity_id].parent_ids
+                and not world._lot(o.entity_id).arrived
+            ),
+            None,
+        )
+        occupied_receiving = any(
+            lot.arrived
+            and world._mass(lot.id) > 1e-9
+            and lot.location in world.places
+            and (world.places[lot.location].parent or lot.location) == "RECEIVE"
+            for lot in obs.state.lots
+        )
+        if (
+            waiting is not None
+            and root is not None
+            and (root.parent or root.id) == "RECEIVE"
+            and not occupied_receiving
+        ):
+            clearance = service_for(waiting, "FORK-01", "FORK-PARK")
+            if clearance:
+                return plan(
+                    config.schema_version,
+                    config.id,
+                    obs.id,
+                    (clearance,),
+                    "CANDIDATE",
+                    "P042:INGRESS_CLEARANCE:" + waiting.product_id,
+                )
+
+    def traffic_clearance(op):
+        if op.route_id and world.routes[op.route_id].device_id in ("FORK-01", "CART-01", "TEST1"):
+            rt = world.routes[op.route_id]
+            p = standing_point(config, "Lsig", "CONTROL-Lsig")
+            obstacle = (
+                ("Lsig", (p[0] - 0.3, p[1] - 0.6, p[2]), (p[0] + 0.3, p[1] + 0.6, p[2] + 1.9)),
+            )
+            blocked = any(
+                not clear_segment(a, b, obstacle, dimensions, margin=0)
+                for path, dimensions in transport_sweeps(config, op, rt)
+                for a, b in zip(path, path[1:])
+            )
+            if positions["Lsig"] == "CONTROL-Lsig" and blocked:
+                return service_for(op, "Lsig", "CONTROL-PARK-Lsig")
+        return None
+
+    def support_preparation(parent, layout_id):
+        layout = next(x for x in config.support_layouts if x.id == layout_id)
+        op = supports.change_operation(
+            config, layout, parent.product_id, f"SERVICE-{obs.state.revision}-{layout.root}-SUPPORT"
+        )
+        cmd = command(op, m.Service(op, None))
+        reason = admissible(cmd)
+        if reason is None:
+            return cmd
+        reasons.append(op.id + ":" + reason)
+        if reason.startswith("SUPPORT_CARRIER_NOT_CLEAR:"):
+            device = reason.split(":", 1)[1]
+            return service_for(parent, device, "FORK-PARK" if device == "FORK-01" else "CART-PARK")
+        if reason == "PERSON_NOT_PRESENT":
+            probe = copy.copy(world)
+            probe.operations = dict(world.operations, **{op.id: op})
+            destinations = {p.person_id: p.location for p in op.role_locations}
+            probe.s = replace(
+                world.s,
+                positions=tuple(
+                    replace(p, location=destinations[p.id], support=destinations[p.id])
+                    if p.id in destinations
+                    else p
+                    for p in world.s.positions
+                ),
+            )
+            try:
+                probe._admit(cmd)
+            except ContractError as exc:
+                reasons.append(op.id + ":" + str(exc))
+                return None
+            for p in op.role_locations:
+                if positions[p.person_id] != p.location:
+                    return service_for(parent, p.person_id, p.location)
+        if reason == "HUMAN_CAP":
+            for p in op.role_locations:
+                rested = service_for(parent, p.person_id, rest=True)
+                if rested:
+                    return rested
+        return None
+
+    def support_plan(parent, layout_id):
+        cmd = support_preparation(parent, layout_id)
+        return (
+            plan(
+                config.schema_version,
+                config.id,
+                obs.id,
+                (cmd,),
+                "CANDIDATE",
+                "PREPARE:" + parent.id,
+            )
+            if cmd
+            else None
+        )
+
+    for op in candidates:
+        if (time.perf_counter() - start) * 1000 > value.budget_ms:
+            return plan(
+                config.schema_version, config.id, obs.id, (), "NO_PLAN_FOUND", "DECISION_BUDGET"
+            )
+        held = next((r for r in obs.state.running if r.command.operation_id == op.id), None)
+        if op.id in done or held and held.status != "EXCEPTION":
+            continue
+        if not applicable(op, obs.state.mode_attempts):
+            continue
+        if op.branch and any(
+            a.activity_id == op.activity_id
+            and (
+                a.handover is not None
+                or (
+                    op.activity_id in crews
+                    and a.crew
+                    and a.crew[0].person_id != crews[op.activity_id]
+                )
+            )
+            for a in obs.state.mode_attempts
+        ):
+            continue
+        if op.branch and op.activity_id in modes and modes[op.activity_id] != op.production_mode:
+            continue
+        if obs.sampled_h + 1e-10 < slots.get(op.activity_id, obs.sampled_h):
+            reasons.append(op.id + ":PLANNED_START_WAIT")
+            continue
+        if not set(op.prerequisites) <= done or not all(
+            completed_activity(config, done, a) for a in op.activity_prerequisites
+        ):
+            reasons.append(op.id + ":PREDECESSORS")
+            continue
+        if op.entity_id in world.lots and not world._lot(op.entity_id).arrived:
+            lot = world.lots[op.entity_id]
+            steel = lot.bom_id == "B-ST" and lot.material == "STEEL"
+            if occupied_ingress[steel] - {lot.group_id}:
+                reasons.append(op.id + ":INGRESS_GROUP_BUSY")
+                continue
+            layout = supports.for_port(config, op.entity_id, op.location)
+            if layout is not None and world.places[op.location].parent == "MEP-RECEIVE":
+                current = world._support_layout(world._support_state(layout.root).layout_id)
+                if not supports.equivalent(current, layout):
+                    prepared = support_plan(op, layout.id)
+                    if prepared:
+                        return prepared
+        cmd = command(op, held=held)
+        if op.branch and op.branch.phase == "ROBOT":
+            for person in config.people:
+                if positions[person.id] == "J2" and not (
+                    config.schema_version == "P043-PROD-1.0" and off_shift(obs.state, person.id)
+                ):
+                    prepared = service_for(op, person.id, control_location(config, person.id))
+                    if prepared:
+                        return plan(
+                            config.schema_version,
+                            config.id,
+                            obs.id,
+                            (prepared,),
+                            "CANDIDATE",
+                            "PREPARE:" + op.id,
+                        )
+        reason = admissible(cmd)
+        if reason is None:
+            clear = traffic_clearance(op)
+            if clear:
+                return plan(
+                    config.schema_version,
+                    config.id,
+                    obs.id,
+                    (clear,),
+                    "CANDIDATE",
+                    "PREPARE:" + op.id,
+                )
+            return plan(config.schema_version, config.id, obs.id, (cmd,), "CANDIDATE", rule)
+        reasons.append(op.id + ":" + reason)
+        if reason.startswith("TRANSPORT_COLLISION:"):
+            cleared = clear_person(op, reason.split(":", 1)[1])
+            if cleared:
+                return plan(
+                    config.schema_version,
+                    config.id,
+                    obs.id,
+                    (cleared,),
+                    "CANDIDATE",
+                    "PREPARE:" + op.id,
+                )
+        if reason == "TRANSPORT_COLLISION:Lsig":
+            clear = traffic_clearance(op)
+            if clear:
+                return plan(
+                    config.schema_version,
+                    config.id,
+                    obs.id,
+                    (clear,),
+                    "CANDIDATE",
+                    "PREPARE:" + op.id,
+                )
+        if reason.startswith("SUPPORT_NOT_READY:"):
+            prepared = support_plan(op, reason.split(":", 1)[1])
+            if prepared:
+                return prepared
+            continue
+        if reason == "KIT_INPUT_NOT_RELEASED" and positions["FORK-01"] == "RECEIVE":
+            prepared = service_for(op, "FORK-01", "STEEL")
+            if prepared:
+                return plan(
+                    config.schema_version,
+                    config.id,
+                    obs.id,
+                    (prepared,),
+                    "CANDIDATE",
+                    "PREPARE:" + op.id,
+                )
+        if held or reason not in ("PERSON_NOT_PRESENT", "DEVICE_NOT_AT_SOURCE", "HUMAN_CAP"):
+            continue
+        # Test other admission constraints before investing in preparation. This is
+        # an estimate only; neither observation nor execution state is changed.
+        probe = copy.copy(world)
+        bound_people = {r.role_id: r.person_id for r in cmd.roles}
+        destinations = {bound_people[p.person_id]: p.location for p in op.role_locations}
+        if op.route_id:
+            carrier = world.routes[op.route_id].device_id
+            if carrier:
+                destinations[carrier] = op.location
+        probe.s = replace(
+            world.s,
+            positions=tuple(
+                replace(p, location=destinations[p.id], support=destinations[p.id])
+                if p.id in destinations
+                else p
+                for p in world.s.positions
+            ),
+        )
+        try:
+            probe._admit(cmd)
+        except ContractError as exc:
+            if str(exc).startswith("TRANSPORT_COLLISION:"):
+                cleared = clear_person(op, str(exc).split(":", 1)[1])
+                if cleared:
+                    return plan(
+                        config.schema_version,
+                        config.id,
+                        obs.id,
+                        (cleared,),
+                        "CANDIDATE",
+                        "PREPARE:" + op.id,
+                    )
+            if str(exc) == "TRANSPORT_COLLISION:Lsig":
+                clear = traffic_clearance(op)
+                if clear:
+                    return plan(
+                        config.schema_version,
+                        config.id,
+                        obs.id,
+                        (clear,),
+                        "CANDIDATE",
+                        "PREPARE:" + op.id,
+                    )
+            if str(exc).startswith("SUPPORT_NOT_READY:"):
+                prepared = support_plan(op, str(exc).split(":", 1)[1])
+                if prepared:
+                    return prepared
+                continue
+            if str(exc) != "HUMAN_CAP":
+                reasons.append(op.id + ":" + str(exc))
+                continue
+        clear = traffic_clearance(op)
+        if clear:
+            return plan(
+                config.schema_version, config.id, obs.id, (clear,), "CANDIDATE", "PREPARE:" + op.id
+            )
+        if op.route_id:
+            device = world.routes[op.route_id].device_id
+            if device and positions[device] != op.location:
+                prepared = service_for(op, device, op.location)
+                if prepared:
+                    return plan(
+                        config.schema_version,
+                        config.id,
+                        obs.id,
+                        (prepared,),
+                        "CANDIDATE",
+                        "PREPARE:" + op.id,
+                    )
+                continue
+        for role in op.role_locations:
+            prepared = None
+            person_id = bound_people[role.person_id]
+            if positions[person_id] != role.location:
+                prepared = service_for(op, person_id, role.location)
+            elif reason == "HUMAN_CAP":
+                prepared = service_for(op, person_id, rest=True)
+            if prepared:
+                return plan(
+                    config.schema_version,
+                    config.id,
+                    obs.id,
+                    (prepared,),
+                    "CANDIDATE",
+                    "PREPARE:" + op.id,
+                )
+    return plan(
+        config.schema_version,
+        config.id,
+        obs.id,
+        (),
+        "WAIT",
+        ";".join(reasons) or "NO_PENDING_OPERATION",
+    )

@@ -1,0 +1,69 @@
+# 基础检查与持续集成（S02 / S03 / S06）
+
+2026-10-07 S16补充：统一入口新增静态CP-SAT参照及对应独立核验测试，默认开发同步包括dev/reference，锁定OR-Tools 9.15.6755。基础包仍无运行依赖；隔离wheel环境先以`uv export --locked --only-group reference`导出锁定依赖，再以`uv pip install --require-hashes`安装，随后无依赖安装本项目wheel并复跑全部测试。下文早期无求解器说明保持历史时点。现行CI预算为Windows25分钟/Ubuntu15分钟，本轮不改变工作流；本轮本地检查不代表远端CI已运行。
+
+当前实施状态（PR088—PR090，2026-10-02）：S12 r1已验收、批准并发布，回执见LOG090。PR089审阅确认三类独立决策审计漏检；PR090仅授权其有限本地修复、必要回归、说明、治理与新审阅包，沿用现有main，不建分支/worktree。r2须另行验收及发布批准；S13—S28与新快照暂存/提交/标签/推送/PR/附件/远端元数据修改未授权。D01—D06限定冻结、工业证据缺口、J2同产品双框驻留/FIX-J2独占及默认HR禁用保持。以下旧授权描述保留历史时点。
+
+统一 CPU 入口检查轻量安装骨架，并对 `scripts/isaac_smoke.py` 做静态、格式和纯回调契约检查。它不导入 Isaac 或运行场景；S03 实际 Kit 证据见 [运行验证](validation/runtime.md)。S06 已加入领域对象、静态接口契约及测试，见 [契约说明](contracts.md)；S09 r2 已有管道领域手工派工内核及180项旧域测试证据，调度算法和研究实验尚未完成。C04/C05建筑契约/执行与S10独立检查测试分别计数；现行入口及边界见[独立检查](validation/checker.md)和[S10步骤卡](steps/S10.md)。本文版本 S11-0.1（2026-10-02）。
+
+## 统一入口
+
+先按 [环境说明](setup.md) 安装 uv 0.12.3 和 CPython 3.12.13，从仓库根目录运行：
+
+```powershell
+uv run --locked --no-editable python scripts/check.py
+```
+
+Windows 使用 PowerShell 7，先确认 `$PSVersionTable.PSVersion.Major` 为 7；具体安装路径仅保存在本地。Linux 可从 Bash 执行同一命令。无需激活虚拟环境；不要设置 `UV_NO_SYNC` 或使用 `--frozen` 绕过锁定检查，也不要把 `UV_PROJECT_ENVIRONMENT` 指向 Isaac 环境。
+
+命令同步默认 dev 组并按顺序执行下列检查；任何非零退出码立即终止，整条命令失败。检查入口不自动修复源码。
+
+| 检查 | 内容与边界 |
+| --- | --- |
+| 版本与锁 | 解释器必须匹配 `.python-version`；`uv lock --check` 核对声明与锁 |
+| 静态与格式 | Ruff 0.16.9；对 `src`、`tests`、`scripts` 检查 E4/E7/E9/F/I 规则及格式 |
+| CPU 自检 | unittest 自动发现：S06 契约测试（见检查摘要），原两项安装自检（隔离包入口、无运行依赖），五项纯回调契约测试（正常、遗漏/重复、错误步号、错误时间、错误 dt） |
+| 环境一致性 | `uv pip check` 检查项目环境 |
+| 构建与 wheel | 禁用构建包缓存，生成 sdist 并由其构建 wheel；新建独立环境，只安装 wheel，重跑全部 unittest 与依赖检查；回调契约测试读取仓库脚本，不表示脚本已装入 wheel |
+
+每次构建使用独立临时目录，完成或异常退出时清理。失败命令会显示在控制台，必要日志应保存在新的本地运行目录。指定 Python 安装可以复用；这不等于重新下载所有工具或完全离线复现。标准错误中的工具进度输出本身不代表失败，以退出码为准。
+
+Ruff 是 MIT 许可的开发工具，精确版本与下载摘要由 `uv.lock` 记录，不属于安装包的运行依赖；仓库不再分发其二进制。S02 曾统一两份已有 Python 文件的格式，未改变安装行为。规则含义见 [Ruff 配置文档](https://docs.astral.sh/ruff/configuration/)。
+
+需要修改格式时主动运行并审阅差异：
+
+```powershell
+uv run --locked python -m ruff format src tests scripts
+```
+
+更新工具时修改 `pyproject.toml`，运行 `uv lock`，再跑统一入口；版本升级属于新的审阅差异。S06 已加入静态领域/接口约束测试；尚无类型检查器或覆盖率门槛。源码改变后可先用 `uv sync --locked --no-editable --reinstall-package adaptive-hrc-scheduling` 重建本地安装，避免旧非 editable 构建缓存；统一入口另以独立 wheel 安装复验。
+
+## GitHub Actions
+
+[工作流](../.github/workflows/ci.yml) 名为 `CPU checks`，在 main 的 push、以 main 为目标的 pull_request 或人工 workflow_dispatch 时触发。只推送步骤标签不会再重复运行。两项作业为 `CPU checks (ubuntu-24.04)` 和 `CPU checks (windows-2025)`，使用同一检查命令及 PowerShell 7；这两个托管镜像名称固定，但镜像内容仍由 GitHub 更新。
+
+权限仅 `contents: read`，checkout 不保留凭据；Action 固定完整提交 SHA，uv 固定 0.12.3，Python 由 `.python-version` 决定。未启用持久缓存，未使用密钥、部署、附件上传或 Isaac/GPU 安装。每项作业超时 15 分钟，矩阵不因另一平台失败而提前结束，同一引用的新运行会取消旧运行。依据见 [uv 官方 CI 指南](https://docs.astral.sh/uv/guides/integration/github/)。
+
+S02 已在本地用 actionlint 1.7.12 检查工作流语法、Action 输入和表达式，官方发布校验值匹配；该工具仅用于当步本地审阅，不加入项目运行依赖。静态通过本身不证明 GitHub 托管环境执行成功，实际远端结果见下文。[actionlint 官方说明](https://github.com/rhysd/actionlint)
+
+## 贡献与发布
+
+本次按负责人决定沿用 main 与现有目录，没有额外分支或 worktree。后续贡献先明确步骤范围，在本地完成统一检查并维护步骤卡、进度记录；出现实质性新指令时才追加规范化记录。暂存时使用确切文件清单，审阅完整差异、提交身份和拟推送历史。分支策略以后续授权为准；工作流支持 PR 不等于已批准创建 PR。
+
+本地 VERIFIED 与人工 ACCEPTED、上传 APPROVED、远端 PUBLISHED 分开。负责人审阅并批准确切快照后，才提交、创建新步骤标签并推送 main 和该标签。不得继承旧步骤批准、强推或移动既有标签；不改变仓库保护规则。
+
+推送后核对工作流运行的 `head_sha`、push 事件、两项作业及总体结论均对应获批提交，同时核验分支、标签和完整文件树。取消、跳过、失败或未启动均不能算通过；PUBLISHED 必须等待所需检查成功。若 CI 失败，保留运行链接与失败证据，修复后的内容须重新审阅批准；不能为了变绿覆盖原标签。相同提交的瞬时网络失败可核实后重跑，不冒称代码修复。
+
+S02 封存时已完成 Windows 本地检查与独立源文件副本检查，其后真实远端结果见下文。尚未开启分支保护或将检查设为 required；S03 的场景运行与 CPU 检查分别记录。
+
+## 已发生的远端核验与 S03 边界
+
+S02 已发布提交 `ba8c8532af937771fcecf8f2f89c38c2bcf05998` 的 [push 工作流](https://github.com/delongwangshu49-hub/adaptive-hrc-scheduling/actions/runs/36742427800) 在 windows-2025 与 ubuntu-24.04 均成功。S03 r1 的 [push 工作流](https://github.com/delongwangshu49-hub/adaptive-hrc-scheduling/actions/runs/36834194178) 两平台也已成功。r2 未修改工作流、检查入口或依赖锁；新增纯回调测试由原入口自动发现，候选仍需获批推送后核验绑定新提交的两平台结果。
+
+不要在轻量环境中执行 Isaac 运行验收，也不要让普通 CI 安装 GPU 环境。Isaac 脚本的 `--help` 可由普通 Python 读取；实际运行需要 Isaac 解释器、场景断言及外部进程正常退出共同通过。脚本不进入项目 wheel，复验需要仓库源文件及独立安装。
+
+S11专项为`tests/test_rule_planners.py`，纳入既有项目/独立wheel检查；入口`python scripts/run_rule_planners.py --output .local/s11-cases --check`。静态初始窗口与条件质量假设见[规则说明](algorithms/rule_baselines.md)。本步不改变依赖、CI、旧域或C05执行内核。
+
+S12专项`tests/test_light_closed_loop.py`纳入统一项目与独立wheel检查；复现命令`python scripts/run_light_loop.py --output .local/s12-cases --check`。质量/工艺反馈是显式合成环境，仅在SYNTHETIC_TEST_ONLY配置启用；完整实际轨迹与去重观测证据只写指定本地目录。S12只为C05增加可选反馈唤醒，原默认行为及S10/S11接口版本保持。
+
+S12 r2本地决策证据标为S12-1.1，新增每轮动作前后实际事件计数；旧r1证据缺这些计数时决策审计返回INCOMPLETE发现，须从原用例重新生成新证据。旧证据原样保留，S10/S11接口及公开11例摘要保持。
